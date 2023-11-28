@@ -103,11 +103,78 @@ _update() {
 	termux_pkg_auto_update
 }
 
+declare -A _LATEST_TAGS=()
 declare -A _FAILED_UPDATES=()
 declare -a _ALREADY_SEEN=() # Array of packages successfully updated or skipped.
 
+: '
+ _fetch_and_cache_tags fetches all possible tags using termux_pkg_auto_update, but using Ninja build system. 
+ The key difference is that we make the process concurrent, allowing us to fetch tags simultaneously rather than one at a time. 
+ Once all tags are cached, the termux_pkg_auto_update function will operate much more quickly. 
+ We avoid packages with overwritten termux_pkg_auto_update to prevent unexpected modifications to the package`s build.sh.
+'
+_fetch_and_cache_tags() {
+	echo "INFO: Fetching and caching tags"
+
+	# First invocation of termux_repology_api_get_latest_version fetches and caches repology metadata.
+	&> /dev/null termux_repology_api_get_latest_version empty
+	eval "$(jq -r 'to_entries | .[] | "_LATEST_TAGS[\"\(.key)\"]=\"\(.value)\""' $TERMUX_REPOLOGY_DATA_FILE)"
+
+    local __PACKAGES=()
+	for repo_dir in $(jq --raw-output 'del(.pkg_format) | keys | .[]' "${TERMUX_SCRIPTDIR}/repo.json"); do
+		for pkg_dir in "${repo_dir}"/*; do
+			! _should_update "${pkg_dir}" && continue # Skip if not needed.
+			grep -q '^termux_pkg_auto_update' "${pkg_dir}/build.sh" && continue # Skip if package has custom auto-update
+			__PACKAGES+=(${pkg_dir})
+		done
+	done
+
+	local LATEST_TAGS="$({
+		echo "
+rule update
+ command = bash -c '\$
+  set -eu; \$
+  source ${TERMUX_SCRIPTDIR}/scripts/updates/internal/termux_github_auto_update.sh; \$
+  source ${TERMUX_SCRIPTDIR}/scripts/updates/internal/termux_gitlab_auto_update.sh; \$
+  source ${TERMUX_SCRIPTDIR}/scripts/updates/api/termux_github_api_get_tag.sh; \$
+  source ${TERMUX_SCRIPTDIR}/scripts/updates/api/termux_gitlab_api_get_tag.sh; \$
+  source ${TERMUX_SCRIPTDIR}/scripts/updates/utils/termux_error_exit.sh; \$
+  source ${TERMUX_SCRIPTDIR}/scripts/updates/termux_pkg_auto_update.sh; \$
+  export TERMUX_SCRIPTDIR=$TERMUX_SCRIPTDIR TERMUX_PKG_NAME=\"\$package\" TERMUX_PKG_BUILDER_DIR=\"\$builder\" GITHUB_TOKEN=\"$GITHUB_TOKEN\"; \$
+  set +eu; \$
+  source \"\$builder\"/build.sh; \$
+  set -eu; \$
+  : \"Repology tags fetching is handled other way\"; \$
+  termux_repology_auto_update() { echo \"PKG|\$\$TERMUX_PKG_NAME|\$\$TERMUX_PKG_VERSION|_REPOLOGY_\"; }; \$
+  termux_pkg_upgrade_version() { \$
+   echo termux_pkg_upgrade_version \"\$\$1\"; \$
+   [ -n \"\$\$1\" ] && echo \"PKG|\$\$TERMUX_PKG_NAME|\$\$(sed \"s/_/./g\" <<< \"\$\$1\")\"; \$
+  }; \$
+  termux_pkg_auto_update' ||:"
+		for pkg_dir in "${__PACKAGES[@]}"; do
+			echo "
+build update_$(sed 's/-/_/g' <<< ${pkg_dir##*/}): update
+ package = ${pkg_dir##*/}
+ builder = $(realpath ${pkg_dir})"
+		done
+		echo "build run_all: phony $(for i in "${__PACKAGES[@]}"; do echo -n " update_$(sed 's/-/_/g' <<< ${i##*/})"; done)"
+		echo "default run_all"
+	} | env --chdir=/tmp ninja -f /dev/stdin)"
+	while read -r line; do
+		[[ "$line" != "PKG|"* ]] && continue
+		local pkg="$(echo $line | cut -d'|' -f2)"
+		local version="$(echo $line | cut -d'|' -f3)"
+		local repology="$(echo $line | cut -d'|' -f4)"
+		
+		[[ -z "$repology" || -z "${_LATEST_TAGS[$pkg]:-}" ]] && \
+			_LATEST_TAGS["$pkg"]="$version"
+	done <<< "$LATEST_TAGS"
+	unset __PACKAGES
+}
+
 _run_update() {
 	local pkg_dir="$1"
+	[[ -n "${_LATEST_TAGS[${pkg_dir##*/}]:-}" ]] && export __CACHED_TAG="${_LATEST_TAGS[${pkg_dir##*/}]}"
 	# Run each package update in separate process since we include their environment variables.
 	local output=""
 	{
@@ -123,6 +190,7 @@ _run_update() {
 	else
 		_ALREADY_SEEN+=("$(basename "${pkg_dir}")")
 	fi
+	unset __CACHED_TAG
 }
 
 declare -a _CACHED_ISSUE_TITLES=()
@@ -169,6 +237,27 @@ _should_update() {
 		return 1
 	fi
 
+	# No need to run buildorder.py in the case if the package is up-to-date
+	if [[ -n "${_LATEST_TAGS[${pkg_dir##*/}]:-}"  ]]; then
+		local LATEST_VERSION="${_LATEST_TAGS[${pkg_dir##*/}]}"
+		local TERMUX_PKG_VERSION="$(set +eu; source "${pkg_dir}/build.sh" 2>/dev/null; echo ${TERMUX_PKG_VERSION#*:})"
+		local TERMUX_PKG_UPDATE_VERSION_REGEXP="$(set +eu; source "${pkg_dir}/build.sh" 2>/dev/null; echo ${TERMUX_PKG_UPDATE_VERSION_REGEXP})"
+		local TERMUX_PKG_UPDATE_VERSION_SED_REGEXP="$(set +eu; source "${pkg_dir}/build.sh" 2>/dev/null; echo ${TERMUX_PKG_UPDATE_VERSION_SED_REGEXP})"
+		
+		[[ -n "${TERMUX_PKG_UPDATE_VERSION_REGEXP}" ]] && \
+			LATEST_VERSION="$(grep -oP "${TERMUX_PKG_UPDATE_VERSION_REGEXP}" <<< "${LATEST_VERSION}" || true)"
+		[[ -n "${TERMUX_PKG_UPDATE_VERSION_SED_REGEXP}" ]] && \
+			LATEST_VERSION="$(sed "${TERMUX_PKG_UPDATE_VERSION_SED_REGEXP}" <<< "${LATEST_VERSION}" || true)"
+
+		if [[ "$LATEST_VERSION" == "$TERMUX_PKG_VERSION" ]]; then
+			echo # Newline.
+			echo "INFO: Updating ${pkg_dir##*/} [Current version: ${_LATEST_TAGS[${pkg_dir##*/}]:-}]" 
+			echo "INFO: Already up to date." 
+			_ALREADY_SEEN+=("$(basename "${pkg_dir}")")
+			return 1
+		fi
+	fi
+
 	return 0
 }
 
@@ -194,6 +283,7 @@ _update_dependencies() {
 echo "INFO: Running update for: $*"
 
 if [[ "$1" == "@all" ]]; then
+	_fetch_and_cache_tags
 	for repo_dir in $(jq --raw-output 'del(.pkg_format) | keys | .[]' "${TERMUX_SCRIPTDIR}/repo.json"); do
 		for pkg_dir in "${repo_dir}"/*; do
 			! _should_update "${pkg_dir}" && continue # Skip if not needed.
